@@ -6,6 +6,9 @@ const PendingApproval = require('./pendingApproval');
 const Promise = require('bluebird');
 const co = Promise.coroutine;
 const _ = require('lodash');
+const PaymentProtocol = require('bitcore-payment-protocol');
+const superagent = require('superagent');
+const moment = require('moment');
 
 const Wallet = function(bitgo, baseCoin, walletData) {
   this.bitgo = bitgo;
@@ -914,6 +917,93 @@ Wallet.prototype.sendMany = function(params, callback) {
 
   }).call(this).asCallback(callback);
 };
+
+Wallet.prototype.getBip72Info = function(params, callback) {
+  return co(function *() {
+    if (!(this.baseCoin.type === 'btc') && !(this.baseCoin.type === 'tbtc')) {
+      throw new Error('Bip 72 only supports BTC');
+    }
+
+    params = params || {};
+    common.validateParams(params, ['url'], [], callback);
+    const url = params.url;
+    if (this.baseCoin.isBip72Uri(url)) {
+      return this.baseCoin.fetchBip72Info(url);
+    }
+    return {};
+
+  }).call(this).asCallback(callback);
+};
+
+Wallet.prototype.sendBip72PaymentResponse = function(params, callback) {
+  return co(function *() {
+
+    const now = moment().utc().unix();
+
+    if (now > params.expires) {
+      throw new Error('Payment request has expired');
+    }
+
+    const sendManyParams = {
+      recipients: params.recipients,
+      walletPassphrase: params.walletPassphrase
+    };
+    const tx = yield this.sendMany(sendManyParams);
+    // const tx = {"txid":"dcc5aa1741c9a69bb580c9ff2e181afab8a7712028ba4fae3fd22d4956bf27ac","tx":"010000000114a85f91021bf71255b36ee9ef69ce030785bde387d0bff600c113db3fc994ba00000000fdfd0000483045022100ace55f57981b37e1028620553f86187e40cd49db993fc0d40d77568c5a56bea402203cb701ad1b87774f25011fc565b9af42c7377b778c38606545ab631a637848c301473044022073c494fbf3a3dcaa86fb7c9adc86b49f27ffc08b2f5b976a84d64277f1ccd244022077c82be27fbdf57e6aa1144a602900a3a5b803d3c495c282ea1494519b56a4c2014c695221023c6b22b29a5fd404b6ba97587edbf82dd19027da9712be4382aa5235ea52e13021025452475aa7897d431a5f702228f27e1d57a62fa47887fd8b2ded8d158fdbc2b221030152f9399de047688c653a3c3865adc4bf6a8bc836be919d92eab204fc9447b753aeffffffff02e0920000000000001976a9141f4def9b8e3f53da38794d3c1afc0d466db58daa88ac521ef5050000000017a9142666e19326fc2718c8415b2d1540930a3f4fbb018700000000","status":"signed"}
+
+    console.log(JSON.stringify(tx));
+
+    params.transactions = [tx.tx];
+
+    const refundAddress = yield this.createAddress();
+    // const refundAddress = this._wallet.receiveAddress;
+    const script = refundAddress.coinSpecific.redeemScript;
+
+
+    // send the payment transaction
+    const payment = new PaymentProtocol().makePayment();
+    payment.set('merchant_data', params.merchant_data);
+    payment.set('transactions', [params.transactions]); // as from payment details
+
+    // define the refund outputs
+    const refund_outputs = [];
+    const outputs = new PaymentProtocol().makeOutput();
+    outputs.set('amount', 0);
+    outputs.set('script', new Buffer(script, 'hex'));
+    refund_outputs.push(outputs.message);
+
+    payment.set('refund_to', refund_outputs);
+    payment.set('memo', 'Here is a payment for diet coke');
+
+    // serialize and send
+    const rawbody = payment.serialize();
+
+    const res = yield superagent
+    .post(params.payment_url)
+    .send(rawbody)
+    .set('Content-Transfer-Encoding', 'binary')
+    .set('Content-Type', 'application/bitcoin-payment')
+    .set('Accept', 'application/bitcoin-paymentrequest')
+    .buffer(true)
+    .parse(superagent.parse.image)
+    .then(res => res.body);
+
+    const body = PaymentProtocol.PaymentACK.decode(res);
+    const ack = new PaymentProtocol().makePaymentACK(body);
+    const serializedPayment = ack.get('payment');
+    const memo = ack.get('memo');
+    const decodedPayment = PaymentProtocol.Payment.decode(serializedPayment);
+    const paymentInfo = new PaymentProtocol().makePayment(decodedPayment);
+
+    return {
+      memo: memo,
+      paymentInfo: paymentInfo,
+      tx: tx
+    };
+
+  }).call(this).asCallback(callback);
+};
+
 
 /**
  * Create a policy rule
